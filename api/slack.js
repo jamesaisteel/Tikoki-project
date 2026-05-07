@@ -153,10 +153,14 @@ async function uploadPdf(channel, pdfBuffer, filename, message) {
     throw err;
   }
   const completeData = await completeRes.json();
-  console.log('[uploadPdf] step 3 response:', JSON.stringify(completeData).slice(0, 300));
+  const fileObj = completeData.files?.[0];
+  console.log('[uploadPdf] step 3 response ok:', completeData.ok, 'error:', completeData.error);
+  console.log('[uploadPdf] file object:', JSON.stringify(fileObj));
   if (!completeData.ok) throw new Error(`completeUploadExternal: ${completeData.error}`);
 
-  const permalink = completeData.files?.[0]?.permalink ?? null;
+  // permalink_public is a files.slack.com link (directly openable);
+  // permalink is an app.slack.com link that requires authentication.
+  const permalink = fileObj?.permalink_public ?? fileObj?.permalink ?? null;
   console.log('[uploadPdf] done, permalink:', permalink);
   return permalink;
 }
