@@ -4,7 +4,7 @@ import { buildQuote, centsToEur, slugify } from './lib/quote.js';
 import { generatePdf } from './lib/pdf.js';
 import { getQuote, setQuote, isDuplicateEvent } from './lib/redis.js';
 import { parseExcelFile } from './lib/excel.js';
-import { uploadPdfToDrive, listImages, fetchImageAsBase64 } from './lib/drive.js';
+import { listImages, fetchImageAsBase64 } from './lib/drive.js';
 
 // Disable Vercel's automatic body parsing so we can read the raw body
 // needed for Slack signature verification
@@ -103,7 +103,10 @@ async function uploadPdf(channel, pdfBuffer, filename, message) {
   });
   const completeData = await completeRes.json();
   if (!completeData.ok) throw new Error(`completeUploadExternal: ${completeData.error}`);
-  console.log('[uploadPdf] upload complete');
+
+  const permalink = completeData.files?.[0]?.permalink ?? null;
+  console.log('[uploadPdf] upload complete, permalink:', permalink);
+  return permalink;
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -159,7 +162,7 @@ async function handleOk(event) {
     return;
   }
 
-  await postMessage(channel, '⏳ Generujem PDF a nahrávam na Drive...');
+  await postMessage(channel, '⏳ Generujem PDF...');
 
   // Clone items so we can attach base64 image data without mutating the Redis-stored quote
   const quoteCopy = { ...quote, items: quote.items.map(i => ({ ...i })) };
@@ -194,30 +197,22 @@ async function handleOk(event) {
     return;
   }
 
-  // Upload to Google Drive
-  let driveLink = null;
+  // Upload PDF to Slack and get the permalink for the follow-up message
+  let permalink = null;
   try {
-    const { fileId, driveLink: link } = await uploadPdfToDrive(pdfBuffer, quote.filename);
-    driveLink = link;
-    // Persist Drive metadata back to Redis
-    await setQuote(user, { ...quote, driveFileId: fileId, driveLink: link });
-  } catch (err) {
-    console.error('[handleOk] Drive upload failed:', err.message);
-    // Non-fatal — we still deliver the PDF via Slack
-  }
-
-  // Build Slack message with Drive link if available
-  const summary = `_Platnosť: 30 dní | ${quoteCopy.items.length} položiek | Celkom: ${centsToEur(quote.totalCents)} vr. DPH_`;
-  const intro = driveLink
-    ? `✅ Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená!\n\n📄 <${driveLink}|${quote.filename}>\n\n${summary}`
-    : `✅ Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená!\n\n${summary}`;
-
-  try {
-    await uploadPdf(channel, pdfBuffer, quote.filename, intro);
+    permalink = await uploadPdf(channel, pdfBuffer, quote.filename, null);
   } catch (err) {
     console.error('[handleOk] Slack uploadPdf failed:', err.message);
-    await postMessage(channel, intro + '\n\n⚠️ PDF sa nepodarilo priložiť priamo — stiahni z Drive odkazu.');
+    await postMessage(channel, `⚠️ PDF sa nepodarilo odoslať: ${err.message}`);
+    return;
   }
+
+  const summary = `_Platnosť: 30 dní | ${quoteCopy.items.length} položiek | Celkom: ${centsToEur(quote.totalCents)} vr. DPH_`;
+  const readyMsg = permalink
+    ? `✅ Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená!\n📄 <${permalink}|Stiahnuť PDF>\n\n${summary}`
+    : `✅ Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená!\n\n${summary}`;
+
+  await postMessage(channel, readyMsg);
 
   // Warn about any images that weren't found, with list of available ones
   if (missingImages.length > 0) {

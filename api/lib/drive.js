@@ -47,7 +47,10 @@ function getAuthClient() {
 
 // ── PDF upload ────────────────────────────────────────────────────────────────
 
-export async function uploadPdfToDrive(pdfBuffer, filename) {
+// Drive PDF upload is disabled — service accounts cannot upload to regular Gmail Drive
+// folders without Google Workspace. Re-enable when a Workspace account is available.
+// eslint-disable-next-line no-unused-vars
+/* export async function uploadPdfToDrive(pdfBuffer, filename) {
   let auth;
   try {
     auth = getAuthClient();
@@ -124,7 +127,7 @@ export async function uploadPdfToDrive(pdfBuffer, filename) {
   }
 
   return { fileId, driveLink: webViewLink };
-}
+} */
 
 // ── Image helpers ─────────────────────────────────────────────────────────────
 
