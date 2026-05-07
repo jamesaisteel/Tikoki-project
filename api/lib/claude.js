@@ -2,34 +2,100 @@ import Anthropic from '@anthropic-ai/sdk';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Extracts the first complete {...} block from a string.
+// Handles responses where Claude adds a preamble, markdown fences, or a trailing note
+// despite being instructed not to.
+function extractJson(raw) {
+  console.log('[claude] full raw response:\n---\n' + raw + '\n---');
+
+  // Fast path: the whole string is already valid JSON
+  try {
+    return JSON.parse(raw);
+  } catch {}
+
+  // Strip markdown code fences: ```json ... ``` or ``` ... ```
+  const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  try {
+    return JSON.parse(stripped);
+  } catch {}
+
+  // Find the outermost { ... } by tracking brace depth
+  let start = -1;
+  let depth = 0;
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (raw[i] === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        const candidate = raw.slice(start, i + 1);
+        try {
+          return JSON.parse(candidate);
+        } catch {
+          // Keep scanning — maybe there's a valid block further in
+          start = -1;
+        }
+      }
+    }
+  }
+
+  throw new Error(`No valid JSON object found in Claude response. Raw (first 500 chars): ${raw.slice(0, 500)}`);
+}
+
+// ── System prompts ────────────────────────────────────────────────────────────
+
 const EXTRACTION_SYSTEM_PROMPT = `You are a quote extraction assistant for Tikoki s.r.o., a custom sneaker manufacturer based in Slovakia.
 
-Salespeople send you natural language messages or transcribed data describing a sales quote. Your job is to extract all relevant information and return a single JSON object — no prose, no markdown fences, no explanation.
+Salespeople send you natural language messages or transcribed data describing a sales quote. Extract all relevant information and return it as a JSON object.
+
+CRITICAL: Your entire response must be a single raw JSON object. No markdown. No code fences. No explanation before or after. No "Here is the JSON:" preamble. Start your response with { and end with }.
 
 Return exactly this shape:
 
 {
-  "customerName": string,           // Full company name, e.g. "Nike Slovakia s.r.o."
-  "customerAddress": string | null, // Street, city — null if not mentioned
-  "language": "sk" | "cz" | "en",  // Detect from customer name locale or explicit instruction; default "sk"
-  "salesPersonName": string | null, // If mentioned in the message
+  "customerName": string,
+  "customerAddress": string | null,
+  "language": "sk" | "cz" | "en",
+  "salesPersonName": string | null,
   "items": [
     {
-      "productName": string,           // Sneaker model or product name
-      "quantity": number,              // Integer
-      "unitPriceEurCents": number,     // Price in euro cents (€120 → 12000)
-      "imageFilename": string | null   // e.g. "air-max-90.jpg" if explicitly mentioned
+      "productName": string,
+      "quantity": number,
+      "unitPriceEurCents": number,
+      "imageFilename": string | null
     }
   ],
-  "notes": string | null             // Any special instructions, delivery notes, etc.
+  "notes": string | null
 }
 
 Rules:
 - prices may appear as "€120", "120 EUR", "120.00", "120,00" — always convert to integer euro cents
 - if a price is missing for an item, set unitPriceEurCents to 0
 - if quantity is missing, set to 1
-- language detection: Slovak/Czech company suffixes (s.r.o., a.s., spol.) → "sk" by default; Czech city names or "česky" instruction → "cz"; English names or "in English" → "en"
-- return ONLY the JSON object, nothing else`;
+- language: Slovak/Czech suffixes (s.r.o., a.s., spol.) → "sk"; Czech city names or "česky" → "cz"; English names or "in English" → "en"; default "sk"
+- customerName: full company name including legal suffix
+- Your response must begin with { and contain nothing else outside the JSON`;
+
+const EDIT_SYSTEM_PROMPT = `You are a quote editing assistant for Tikoki s.r.o., a custom sneaker manufacturer.
+
+You receive a Quote JSON object and an edit command. Apply the edit and return the updated Quote JSON.
+
+CRITICAL: Your entire response must be a single raw JSON object. No markdown. No code fences. No explanation. Start your response with { and end with }.
+
+Recalculation rules (always apply after any price or quantity change):
+- lineTotalCents = quantity × unitPriceEurCents  (per item)
+- subtotalCents  = sum of all lineTotalCents
+- vatCents       = Math.round(subtotalCents × 0.23)
+- totalCents     = subtotalCents + vatCents
+
+Rules:
+- Preserve all fields not mentioned in the edit command (quoteNumber, version, createdAt, validUntil, slackUserId, salesPerson, language, filename, etc.)
+- If a new item is added, assign the next sequential index value
+- Prices follow the same format rules as extraction (€120 → 12000 cents)
+- Your response must begin with { and contain nothing else outside the JSON`;
+
+// ── Exported functions ────────────────────────────────────────────────────────
 
 export async function extractQuote(text) {
   console.log('[claude.extractQuote] input length:', text.length);
@@ -45,40 +111,14 @@ export async function extractQuote(text) {
         cache_control: { type: 'ephemeral' },
       },
     ],
-    messages: [
-      {
-        role: 'user',
-        content: text,
-      },
-    ],
+    messages: [{ role: 'user', content: text }],
   });
 
   const raw = response.content[0].text.trim();
-  console.log('[claude.extractQuote] raw response:', raw.slice(0, 200));
-
-  // Strip markdown code fences if Claude wraps the JSON despite instructions
-  const json = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-
-  const parsed = JSON.parse(json);
+  const parsed = extractJson(raw);
   console.log('[claude.extractQuote] parsed ok, items:', parsed.items?.length ?? 0);
   return parsed;
 }
-
-const EDIT_SYSTEM_PROMPT = `You are a quote editing assistant for Tikoki s.r.o., a custom sneaker manufacturer.
-
-You receive a Quote JSON object and an edit command from a salesperson. Apply the edit and return the updated Quote JSON — no prose, no markdown fences, nothing else.
-
-Recalculation rules (always apply after any price or quantity change):
-- lineTotalCents = quantity × unitPriceEurCents  (for each item)
-- subtotalCents  = sum of all lineTotalCents
-- vatCents       = Math.round(subtotalCents × 0.23)
-- totalCents     = subtotalCents + vatCents
-
-Rules:
-- Preserve all fields not mentioned in the edit command (quoteNumber, version, createdAt, validUntil, slackUserId, salesPerson, language, filename, etc.)
-- If a new item is added, assign the next sequential index value
-- Prices in edit commands follow the same format rules as extraction (€120 → 12000 cents)
-- Return ONLY the updated JSON object, nothing else`;
 
 export async function editQuote(currentQuote, command) {
   console.log('[claude.editQuote] command:', command.slice(0, 100));
@@ -103,10 +143,7 @@ export async function editQuote(currentQuote, command) {
   });
 
   const raw = response.content[0].text.trim();
-  console.log('[claude.editQuote] raw response:', raw.slice(0, 200));
-
-  const json = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-  const updated = JSON.parse(json);
+  const updated = extractJson(raw);
   console.log('[claude.editQuote] updated ok, items:', updated.items?.length ?? 0);
   return updated;
 }
