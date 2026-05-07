@@ -102,7 +102,7 @@ async function httpsPut(targetUrl, buffer, maxRedirects = 3) {
 }
 
 // Uploads a PDF buffer to a Slack channel using the Files v2 API.
-async function uploadPdf(channel, pdfBuffer, filename, message) {
+async function uploadPdf(channel, pdfBuffer, filename) {
   const token = process.env.SLACK_BOT_TOKEN;
 
   // Step 1 — request an upload URL
@@ -129,40 +129,24 @@ async function uploadPdf(channel, pdfBuffer, filename, message) {
   }
 
   // Step 3 — complete the upload and share into the channel.
-  // Only include initial_comment if non-null — Slack rejects null field values
-  // with invalid_arguments.
   const completePayload = {
     files: [{ id: file_id, title: filename }],
     channel_id: channel,
-    ...(message != null ? { initial_comment: message } : {}),
   };
   console.log('[uploadPdf] step 3: completeUploadExternal payload:', JSON.stringify(completePayload));
 
-  let completeRes;
-  try {
-    completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(completePayload),
-    });
-  } catch (err) {
-    logFetchError('step 3 completeUploadExternal', err);
-    throw err;
-  }
+  const completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(completePayload),
+  });
   const completeData = await completeRes.json();
-  const fileObj = completeData.files?.[0];
   console.log('[uploadPdf] step 3 response ok:', completeData.ok, 'error:', completeData.error);
-  console.log('[uploadPdf] file object:', JSON.stringify(fileObj));
   if (!completeData.ok) throw new Error(`completeUploadExternal: ${completeData.error}`);
-
-  // permalink_public is a files.slack.com link (directly openable);
-  // permalink is an app.slack.com link that requires authentication.
-  const permalink = fileObj?.permalink_public ?? fileObj?.permalink ?? null;
-  console.log('[uploadPdf] done, permalink:', permalink);
-  return permalink;
+  console.log('[uploadPdf] done');
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -253,22 +237,13 @@ async function handleOk(event) {
     return;
   }
 
-  // Upload PDF to Slack and get the permalink for the follow-up message
-  let permalink = null;
   try {
-    permalink = await uploadPdf(channel, pdfBuffer, quote.filename, null);
+    await uploadPdf(channel, pdfBuffer, quote.filename);
   } catch (err) {
     console.error('[handleOk] Slack uploadPdf failed:', err.message);
     await postMessage(channel, `⚠️ PDF sa nepodarilo odoslať: ${err.message}`);
     return;
   }
-
-  const summary = `_Platnosť: 30 dní | ${quoteCopy.items.length} položiek | Celkom: ${centsToEur(quote.totalCents)} vr. DPH_`;
-  const readyMsg = permalink
-    ? `✅ Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená!\n📄 <${permalink}|Stiahnuť PDF>\n\n${summary}`
-    : `✅ Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená!\n\n${summary}`;
-
-  await postMessage(channel, readyMsg);
 
   // Warn about any images that weren't found, with list of available ones
   if (missingImages.length > 0) {
