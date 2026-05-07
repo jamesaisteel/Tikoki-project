@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import https from 'node:https';
 import { extractQuote, editQuote } from './lib/claude.js';
 import { buildQuote, centsToEur, slugify } from './lib/quote.js';
 import { generatePdf } from './lib/pdf.js';
@@ -63,50 +62,12 @@ async function postMessage(channel, text) {
   }
 }
 
-// PUT a buffer to a URL using the native https module, manually following
-// redirects so the buffer is never detached (unlike Node.js fetch).
-function httpsPutOnce(targetUrl, buffer) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(targetUrl);
-    const req = https.request({
-      hostname: parsed.hostname,
-      path: parsed.pathname + parsed.search,
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/pdf',
-        'Content-Length': buffer.length,
-      },
-    }, (res) => {
-      res.resume();
-      resolve({ statusCode: res.statusCode, location: res.headers.location });
-    });
-    req.on('error', reject);
-    req.write(buffer);
-    req.end();
-  });
-}
-
-async function httpsPut(targetUrl, buffer, maxRedirects = 3) {
-  let url = targetUrl;
-  for (let i = 0; i <= maxRedirects; i++) {
-    const { statusCode, location } = await httpsPutOnce(url, buffer);
-    console.log('[httpsPut] status:', statusCode, 'location:', location ?? '(none)');
-    if (statusCode === 200 || statusCode === 204) return statusCode;
-    if ([301, 302, 303, 307].includes(statusCode) && location) {
-      url = location;
-      continue;
-    }
-    throw new Error(`PUT failed: HTTP ${statusCode}`);
-  }
-  throw new Error(`PUT failed: too many redirects (>${maxRedirects})`);
-}
-
 // Uploads a PDF buffer to a Slack channel using the Files v2 API.
-async function uploadPdf(channel, pdfBuffer, filename) {
+async function uploadPdf(channel, pdfBuffer, filename, message) {
   const token = process.env.SLACK_BOT_TOKEN;
 
   // Step 1 — request an upload URL
-  console.log('[uploadPdf] step 1: getUploadURLExternal for', filename, pdfBuffer.length, 'bytes');
+  console.log('[uploadPdf] requesting upload URL for', filename, pdfBuffer.length, 'bytes');
   const urlRes = await fetch('https://slack.com/api/files.getUploadURLExternal', {
     method: 'POST',
     headers: {
@@ -116,37 +77,33 @@ async function uploadPdf(channel, pdfBuffer, filename) {
     body: new URLSearchParams({ filename, length: String(pdfBuffer.length) }),
   });
   const { ok: urlOk, upload_url, file_id, error: urlErr } = await urlRes.json();
-  console.log('[uploadPdf] step 1 response: ok=', urlOk, 'file_id=', file_id, 'error=', urlErr);
   if (!urlOk) throw new Error(`getUploadURLExternal: ${urlErr}`);
 
-  // Step 2 — PUT the file bytes to the pre-signed URL via native https (avoids
-  // Node.js fetch redirect bug that detaches the ArrayBuffer).
-  console.log('[uploadPdf] step 2: PUT', pdfBuffer.length, 'bytes to pre-signed URL');
-  const statusCode = await httpsPut(upload_url, Buffer.from(pdfBuffer));
-  console.log('[uploadPdf] step 2 PUT status:', statusCode);
-  if (statusCode < 200 || statusCode >= 300) {
-    throw new Error(`PUT pre-signed URL failed: HTTP ${statusCode}`);
-  }
+  // Step 2 — PUT the file bytes to the pre-signed URL
+  console.log('[uploadPdf] uploading to pre-signed URL, file_id:', file_id);
+  await fetch(upload_url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: pdfBuffer,
+  });
 
-  // Step 3 — complete the upload and share into the channel.
-  const completePayload = {
-    files: [{ id: file_id, title: filename }],
-    channel_id: channel,
-  };
-  console.log('[uploadPdf] step 3: completeUploadExternal payload:', JSON.stringify(completePayload));
-
+  // Step 3 — complete the upload and share into the channel
+  console.log('[uploadPdf] completing upload');
   const completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(completePayload),
+    body: JSON.stringify({
+      files: [{ id: file_id, title: filename }],
+      channel_id: channel,
+      initial_comment: message,
+    }),
   });
   const completeData = await completeRes.json();
-  console.log('[uploadPdf] step 3 response ok:', completeData.ok, 'error:', completeData.error);
   if (!completeData.ok) throw new Error(`completeUploadExternal: ${completeData.error}`);
-  console.log('[uploadPdf] done');
+  console.log('[uploadPdf] upload complete');
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -238,10 +195,15 @@ async function handleOk(event) {
   }
 
   try {
-    await uploadPdf(channel, pdfBuffer, quote.filename);
+    await uploadPdf(
+      channel,
+      pdfBuffer,
+      quote.filename,
+      `📄 Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená! | Celkom: ${centsToEur(quote.totalCents)} vr. DPH`
+    );
   } catch (err) {
-    console.error('[handleOk] Slack uploadPdf failed:', err.message);
-    await postMessage(channel, `⚠️ PDF sa nepodarilo odoslať: ${err.message}`);
+    console.error('[handleOk] uploadPdf failed:', err.message);
+    await postMessage(channel, `⚠️ PDF vygenerované, ale nepodarilo sa odoslať: ${err.message}`);
     return;
   }
 
