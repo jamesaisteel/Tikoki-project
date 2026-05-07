@@ -15,6 +15,22 @@ export const config = {
 // Replaced by Redis in Stage 4 — warm Vercel instances retain this between requests.
 const quoteStore = new Map();
 
+// In-memory event dedup store: eventId → timestamp (ms).
+// Replaced by Redis dedup in Stage 7.
+const seenEvents = new Map();
+const DEDUP_TTL_MS = 60_000;
+
+function isDuplicate(eventId) {
+  const now = Date.now();
+  // Evict expired entries to prevent unbounded growth
+  for (const [id, ts] of seenEvents) {
+    if (now - ts > DEDUP_TTL_MS) seenEvents.delete(id);
+  }
+  if (seenEvents.has(eventId)) return true;
+  seenEvents.set(eventId, now);
+  return false;
+}
+
 // ── Slack helpers ─────────────────────────────────────────────────────────────
 
 async function getRawBody(req) {
@@ -265,6 +281,18 @@ export default async function handler(req, res) {
   }
 
   if (payload.type === 'event_callback') {
+    // Drop Slack retries immediately — we already processed (or are processing) this event
+    if (req.headers['x-slack-retry-num']) {
+      console.log('[handler] retry request ignored, x-slack-retry-num:', req.headers['x-slack-retry-num']);
+      return res.status(200).json({ ok: true });
+    }
+
+    // In-memory dedup: ignore the same event_id within 60 s
+    if (isDuplicate(payload.event_id)) {
+      console.log('[handler] duplicate event_id ignored:', payload.event_id);
+      return res.status(200).json({ ok: true });
+    }
+
     const event = payload.event;
     console.log('[handler] event type:', event.type, '| subtype:', event.subtype ?? 'none', '| channel_type:', event.channel_type, '| bot_id:', event.bot_id ?? 'none');
 
