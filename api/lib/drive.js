@@ -1,5 +1,4 @@
 import { google } from 'googleapis';
-import { Readable } from 'stream';
 
 // Vercel (and other platforms) can store private keys in several broken forms:
 //   - literal \n  (most common — pasted from a JSON file or typed manually)
@@ -49,56 +48,82 @@ function getAuthClient() {
 // ── PDF upload ────────────────────────────────────────────────────────────────
 
 export async function uploadPdfToDrive(pdfBuffer, filename) {
-  let auth, drive;
+  let auth;
   try {
     auth = getAuthClient();
-    drive = google.drive({ version: 'v3', auth });
   } catch (err) {
     console.error('[drive.upload] auth setup failed:', err.message);
     throw err;
   }
 
-  console.log('[drive.upload] uploading', filename, pdfBuffer.length, 'bytes to folder:', process.env.GOOGLE_DRIVE_FOLDER_ID);
+  // Obtain a short-lived OAuth2 access token from the JWT client
+  const { token } = await auth.getAccessToken();
+  if (!token) throw new Error('Drive auth: failed to obtain access token');
 
-  let file;
-  try {
-    const res = await drive.files.create({
-      // supportsAllDrives: file is created inside the parent folder owned by the
-      // user's Google account; without this flag Drive tries to bill the service
-      // account's own storage quota, which is zero and causes "does not have
-      // storage quota" errors.
-      supportsAllDrives: true,
-      requestBody: {
-        name: filename,
-        parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
-      },
-      media: {
-        mimeType: 'application/pdf',
-        body: Readable.from(pdfBuffer),
-      },
-      fields: 'id,webViewLink',
-    });
-    file = res.data;
-  } catch (err) {
-    const detail = err.response?.data?.error ?? err.message;
-    console.error('[drive.upload] files.create failed:', JSON.stringify(detail));
-    throw new Error(`Drive files.create: ${JSON.stringify(detail)}`);
+  const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+  console.log('[drive.upload] uploading', filename, pdfBuffer.length, 'bytes to folder:', folderId);
+
+  // Build a multipart/related body — two parts: JSON metadata + binary PDF.
+  // We use a direct fetch instead of the googleapis client because the client
+  // routes the upload through the service account's own Drive root when the
+  // googleapis stream wrapper is involved, triggering "storage quota" errors
+  // even when supportsAllDrives is set. A raw HTTP upload with the parent
+  // folder ID in the metadata is unambiguous.
+  const boundary = '-------tikoki_upload_boundary';
+  const metadata = JSON.stringify({
+    name: filename,
+    parents: [folderId],
+    mimeType: 'application/pdf',
+  });
+
+  const body = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
+      `--${boundary}\r\nContent-Type: application/pdf\r\n\r\n`
+    ),
+    pdfBuffer,
+    Buffer.from(`\r\n--${boundary}--`),
+  ]);
+
+  const uploadUrl = new URL('https://www.googleapis.com/upload/drive/v3/files');
+  uploadUrl.searchParams.set('uploadType', 'multipart');
+  uploadUrl.searchParams.set('supportsAllDrives', 'true');
+  uploadUrl.searchParams.set('fields', 'id,webViewLink');
+
+  const uploadRes = await fetch(uploadUrl.toString(), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': `multipart/related; boundary=${boundary}`,
+      'Content-Length': String(body.length),
+    },
+    body,
+  });
+
+  const uploadData = await uploadRes.json();
+  if (!uploadRes.ok) {
+    console.error('[drive.upload] upload failed:', JSON.stringify(uploadData));
+    throw new Error(`Drive upload HTTP ${uploadRes.status}: ${JSON.stringify(uploadData?.error ?? uploadData)}`);
   }
 
+  const fileId = uploadData.id;
+  const webViewLink = uploadData.webViewLink;
+  console.log('[drive.upload] uploaded ok, fileId:', fileId);
+
+  // Set anyoneWithLink reader permission via googleapis (permissions API has no upload quirks)
   try {
+    const drive = google.drive({ version: 'v3', auth });
     await drive.permissions.create({
-      fileId: file.id,
+      fileId,
       supportsAllDrives: true,
       requestBody: { role: 'reader', type: 'anyone' },
     });
   } catch (err) {
     const detail = err.response?.data?.error ?? err.message;
-    console.error('[drive.upload] permissions.create failed:', JSON.stringify(detail));
-    // Non-fatal — file is uploaded, just not publicly shared
+    console.error('[drive.upload] permissions.create failed (non-fatal):', JSON.stringify(detail));
   }
 
-  console.log('[drive.upload] done, fileId:', file.id);
-  return { fileId: file.id, driveLink: file.webViewLink };
+  return { fileId, driveLink: webViewLink };
 }
 
 // ── Image helpers ─────────────────────────────────────────────────────────────
