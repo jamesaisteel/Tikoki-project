@@ -2,15 +2,42 @@ import chromium from '@sparticuz/chromium';
 import puppeteer from 'puppeteer-core';
 import { centsToEur, formatDate } from './quote.js';
 
+function escHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function buildHtml(quote) {
+  const hasImages = quote.items.some(i => i.imageBase64);
+  const fotoItems = quote.items.filter(i => i.imageBase64);
+
   const itemRows = quote.items.map(item => `
     <tr>
       <td class="num">${item.index}</td>
+      ${hasImages ? `<td class="img-cell">${
+        item.imageBase64
+          ? `<img src="data:${item.imageMimeType ?? 'image/jpeg'};base64,${item.imageBase64}" class="thumb" />`
+          : ''
+      }</td>` : ''}
       <td>${escHtml(item.productName)}</td>
       <td class="num">${item.quantity}</td>
       <td class="num">${centsToEur(item.unitPriceEurCents)}</td>
       <td class="num bold">${centsToEur(item.lineTotalCents)}</td>
     </tr>`).join('');
+
+  const fotoPages = fotoItems.map(item => `
+    <div class="foto-page">
+      <div class="foto-caption">${escHtml(item.productName)}</div>
+      ${item.imageFilename ? `<div class="foto-filename">${escHtml(item.imageFilename)}</div>` : ''}
+      <img
+        src="data:${item.imageMimeType ?? 'image/jpeg'};base64,${item.imageBase64}"
+        class="foto-img"
+        alt="${escHtml(item.productName)}"
+      />
+    </div>`).join('');
 
   return `<!DOCTYPE html>
 <html lang="sk">
@@ -89,9 +116,11 @@ function buildHtml(quote) {
   thead th.num { text-align: right; }
   tbody tr { border-bottom: 1px solid #e5e7eb; }
   tbody tr:nth-child(even) { background: #f9fafb; }
-  tbody td { padding: 11px 14px; }
+  tbody td { padding: 11px 14px; vertical-align: middle; }
   td.num { text-align: right; }
   td.bold { font-weight: 700; }
+  td.img-cell { width: 80px; padding: 6px 14px; }
+  img.thumb { max-height: 50px; max-width: 65px; object-fit: contain; display: block; }
 
   /* ── Totals ── */
   .totals-wrapper { display: flex; justify-content: flex-end; }
@@ -118,7 +147,50 @@ function buildHtml(quote) {
   .notes { margin-top: 28px; font-size: 12px; color: #4b5563; }
   .notes .label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #9ca3af; margin-bottom: 4px; }
 
-  /* ── Footer ── */
+  /* ── Fotodokumentácia ── */
+  .foto-section {
+    break-before: page;
+    padding: 40px 48px 100px;
+  }
+  .foto-section-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-weight: 800;
+    color: #6b7280;
+    margin-bottom: 32px;
+    padding-bottom: 12px;
+    border-bottom: 2px solid #111827;
+  }
+  .foto-page {
+    margin-bottom: 0;
+    break-before: page;
+    padding: 0 0 80px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .foto-page:first-of-type { break-before: avoid; }
+  .foto-caption {
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: 6px;
+    color: #111827;
+  }
+  .foto-filename {
+    font-size: 11px;
+    color: #9ca3af;
+    margin-bottom: 16px;
+    font-family: monospace;
+  }
+  .foto-img {
+    max-width: 100%;
+    max-height: 660px;
+    object-fit: contain;
+    display: block;
+  }
+
+  /* ── Footer (fixed, appears on every page) ── */
   .footer {
     position: fixed;
     bottom: 0; left: 0; right: 0;
@@ -173,6 +245,7 @@ function buildHtml(quote) {
     <thead>
       <tr>
         <th style="width:32px">#</th>
+        ${hasImages ? '<th style="width:80px">Foto</th>' : ''}
         <th>Produkt</th>
         <th class="num" style="width:80px">Množstvo</th>
         <th class="num" style="width:110px">Jedn. cena</th>
@@ -205,6 +278,12 @@ function buildHtml(quote) {
 
 </div>
 
+${fotoItems.length > 0 ? `
+<div class="foto-section">
+  <div class="foto-section-title">Fotodokumentácia</div>
+  ${fotoPages}
+</div>` : ''}
+
 <div class="footer">
   <span>Ponuka č. ${escHtml(quote.quoteNumber)} | Platnosť 30 dní od dátumu vystavenia</span>
   <span>Tikoki s.r.o. &nbsp;|&nbsp; info@tikoki.sk &nbsp;|&nbsp; www.tikoki.sk</span>
@@ -214,16 +293,8 @@ function buildHtml(quote) {
 </html>`;
 }
 
-function escHtml(str) {
-  return String(str ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
 export async function generatePdf(quote) {
-  console.log('[pdf.generatePdf] starting for quote:', quote.quoteNumber);
+  console.log('[pdf.generatePdf] starting for quote:', quote.quoteNumber, '| foto pages:', quote.items.filter(i => i.imageBase64).length);
 
   const executablePath =
     process.env.PUPPETEER_EXECUTABLE_PATH || (await chromium.executablePath());

@@ -4,6 +4,7 @@ import { buildQuote, centsToEur, slugify } from './lib/quote.js';
 import { generatePdf } from './lib/pdf.js';
 import { getQuote, setQuote, isDuplicateEvent } from './lib/redis.js';
 import { parseExcelFile } from './lib/excel.js';
+import { uploadPdfToDrive, listImages, fetchImageAsBase64 } from './lib/drive.js';
 
 // Disable Vercel's automatic body parsing so we can read the raw body
 // needed for Slack signature verification
@@ -158,27 +159,78 @@ async function handleOk(event) {
     return;
   }
 
-  await postMessage(channel, '⏳ Generujem PDF, moment...');
+  await postMessage(channel, '⏳ Generujem PDF a nahrávam na Drive...');
+
+  // Clone items so we can attach base64 image data without mutating the Redis-stored quote
+  const quoteCopy = { ...quote, items: quote.items.map(i => ({ ...i })) };
+  const missingImages = [];
+
+  for (const item of quoteCopy.items) {
+    if (!item.imageFilename) continue;
+    try {
+      const img = await fetchImageAsBase64(item.imageFilename);
+      if (img) {
+        item.imageBase64 = img.base64;
+        item.imageMimeType = img.mimeType;
+        item.imageAvailable = true;
+        console.log('[handleOk] fetched image:', item.imageFilename);
+      } else {
+        missingImages.push(item.imageFilename);
+        item.imageAvailable = false;
+      }
+    } catch (err) {
+      console.error('[handleOk] fetchImage failed for', item.imageFilename, ':', err.message);
+      missingImages.push(item.imageFilename);
+      item.imageAvailable = false;
+    }
+  }
 
   let pdfBuffer;
   try {
-    pdfBuffer = await generatePdf(quote);
+    pdfBuffer = await generatePdf(quoteCopy);
   } catch (err) {
     console.error('[handleOk] generatePdf failed:', err.message);
     await postMessage(channel, `⚠️ Chyba pri generovaní PDF: ${err.message}`);
     return;
   }
 
+  // Upload to Google Drive
+  let driveLink = null;
   try {
-    await uploadPdf(
-      channel,
-      pdfBuffer,
-      quote.filename,
-      `📄 Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená! | Celkom: ${centsToEur(quote.totalCents)} vr. DPH`
-    );
+    const { fileId, driveLink: link } = await uploadPdfToDrive(pdfBuffer, quote.filename);
+    driveLink = link;
+    // Persist Drive metadata back to Redis
+    await setQuote(user, { ...quote, driveFileId: fileId, driveLink: link });
   } catch (err) {
-    console.error('[handleOk] uploadPdf failed:', err.message);
-    await postMessage(channel, `⚠️ PDF vygenerované, ale nepodarilo sa odoslať: ${err.message}`);
+    console.error('[handleOk] Drive upload failed:', err.message);
+    // Non-fatal — we still deliver the PDF via Slack
+  }
+
+  // Build Slack message with Drive link if available
+  const summary = `_Platnosť: 30 dní | ${quoteCopy.items.length} položiek | Celkom: ${centsToEur(quote.totalCents)} vr. DPH_`;
+  const intro = driveLink
+    ? `✅ Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená!\n\n📄 <${driveLink}|${quote.filename}>\n\n${summary}`
+    : `✅ Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená!\n\n${summary}`;
+
+  try {
+    await uploadPdf(channel, pdfBuffer, quote.filename, intro);
+  } catch (err) {
+    console.error('[handleOk] Slack uploadPdf failed:', err.message);
+    await postMessage(channel, intro + '\n\n⚠️ PDF sa nepodarilo priložiť priamo — stiahni z Drive odkazu.');
+  }
+
+  // Warn about any images that weren't found, with list of available ones
+  if (missingImages.length > 0) {
+    try {
+      const available = await listImages();
+      const names = available.map(f => f.name).join(', ') || '(žiadne)';
+      await postMessage(
+        channel,
+        `⚠️ Tieto obrázky sa nenašli v Tikoki-Images: *${missingImages.join(', ')}*\nDostupné súbory: ${names}`
+      );
+    } catch {
+      await postMessage(channel, `⚠️ Obrázky nenájdené: *${missingImages.join(', ')}*`);
+    }
   }
 }
 
