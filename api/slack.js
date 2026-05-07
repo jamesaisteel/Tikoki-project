@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import https from 'node:https';
 import { extractQuote, editQuote } from './lib/claude.js';
 import { buildQuote, centsToEur, slugify } from './lib/quote.js';
 import { generatePdf } from './lib/pdf.js';
@@ -62,10 +63,27 @@ async function postMessage(channel, text) {
   }
 }
 
-function logFetchError(step, err) {
-  console.error(`[uploadPdf] ${step} fetch failed:`, err?.message);
-  console.error(`[uploadPdf] ${step} error.cause:`, err?.cause);
-  console.error(`[uploadPdf] ${step} full error:`, err);
+// PUT a buffer to a URL using the native https module, which handles redirects
+// correctly without detaching the ArrayBuffer (unlike Node.js fetch).
+function httpsPut(targetUrl, buffer) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(targetUrl);
+    const req = https.request({
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/pdf',
+        'Content-Length': buffer.length,
+      },
+    }, (res) => {
+      res.resume();
+      resolve(res.statusCode);
+    });
+    req.on('error', reject);
+    req.write(buffer);
+    req.end();
+  });
 }
 
 // Uploads a PDF buffer to a Slack channel using the Files v2 API.
@@ -74,41 +92,25 @@ async function uploadPdf(channel, pdfBuffer, filename, message) {
 
   // Step 1 — request an upload URL
   console.log('[uploadPdf] step 1: getUploadURLExternal for', filename, pdfBuffer.length, 'bytes');
-  let urlRes;
-  try {
-    urlRes = await fetch('https://slack.com/api/files.getUploadURLExternal', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({ filename, length: String(pdfBuffer.length) }),
-    });
-  } catch (err) {
-    logFetchError('step 1 getUploadURLExternal', err);
-    throw err;
-  }
+  const urlRes = await fetch('https://slack.com/api/files.getUploadURLExternal', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({ filename, length: String(pdfBuffer.length) }),
+  });
   const { ok: urlOk, upload_url, file_id, error: urlErr } = await urlRes.json();
   console.log('[uploadPdf] step 1 response: ok=', urlOk, 'file_id=', file_id, 'error=', urlErr);
   if (!urlOk) throw new Error(`getUploadURLExternal: ${urlErr}`);
 
-  // Step 2 — PUT the file bytes to the pre-signed URL (Slack requires PUT, not POST)
+  // Step 2 — PUT the file bytes to the pre-signed URL via native https (avoids
+  // Node.js fetch redirect bug that detaches the ArrayBuffer).
   console.log('[uploadPdf] step 2: PUT', pdfBuffer.length, 'bytes to pre-signed URL');
-  let putRes;
-  try {
-    putRes = await fetch(upload_url, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: Buffer.from(pdfBuffer),
-    });
-  } catch (err) {
-    logFetchError('step 2 PUT pre-signed URL', err);
-    throw err;
-  }
-  console.log('[uploadPdf] step 2 PUT status:', putRes.status, putRes.statusText);
-  if (!putRes.ok) {
-    const body = await putRes.text().catch(() => '');
-    throw new Error(`PUT pre-signed URL failed: HTTP ${putRes.status} — ${body.slice(0, 200)}`);
+  const statusCode = await httpsPut(upload_url, Buffer.from(pdfBuffer));
+  console.log('[uploadPdf] step 2 PUT status:', statusCode);
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error(`PUT pre-signed URL failed: HTTP ${statusCode}`);
   }
 
   // Step 3 — complete the upload and share into the channel.
