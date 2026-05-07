@@ -1,7 +1,8 @@
 import crypto from 'crypto';
-import { extractQuote } from './lib/claude.js';
-import { buildQuote, centsToEur } from './lib/quote.js';
+import { extractQuote, editQuote } from './lib/claude.js';
+import { buildQuote, centsToEur, slugify } from './lib/quote.js';
 import { generatePdf } from './lib/pdf.js';
+import { getQuote, setQuote, isDuplicateEvent } from './lib/redis.js';
 
 // Disable Vercel's automatic body parsing so we can read the raw body
 // needed for Slack signature verification
@@ -10,26 +11,6 @@ export const config = {
     bodyParser: false,
   },
 };
-
-// In-memory quote store keyed by Slack user ID.
-// Replaced by Redis in Stage 4 — warm Vercel instances retain this between requests.
-const quoteStore = new Map();
-
-// In-memory event dedup store: eventId → timestamp (ms).
-// Replaced by Redis dedup in Stage 7.
-const seenEvents = new Map();
-const DEDUP_TTL_MS = 60_000;
-
-function isDuplicate(eventId) {
-  const now = Date.now();
-  // Evict expired entries to prevent unbounded growth
-  for (const [id, ts] of seenEvents) {
-    if (now - ts > DEDUP_TTL_MS) seenEvents.delete(id);
-  }
-  if (seenEvents.has(eventId)) return true;
-  seenEvents.set(eventId, now);
-  return false;
-}
 
 // ── Slack helpers ─────────────────────────────────────────────────────────────
 
@@ -125,38 +106,39 @@ async function uploadPdf(channel, pdfBuffer, filename, message) {
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
-function formatSummary(q) {
-  const langLabel = { sk: '🇸🇰 SK', cz: '🇨🇿 CZ', en: '🇬🇧 EN' }[q.language] ?? q.language;
+// Accepts a Quote object (from Redis / buildQuote).
+function formatSummary(quote, header = '✅ *Parsovaná ponuka — prosím skontroluj:*') {
+  const langLabel = { sk: '🇸🇰 SK', cz: '🇨🇿 CZ', en: '🇬🇧 EN' }[quote.language] ?? quote.language;
 
-  const itemLines = q.items.map((item, i) => {
-    const lineTotal = item.quantity * item.unitPriceEurCents;
-    return `  ${i + 1}. *${item.productName}* — ${item.quantity} ks @ ${centsToEur(item.unitPriceEurCents)} = ${centsToEur(lineTotal)}`;
-  });
-
-  const subtotalCents = q.items.reduce((sum, item) => sum + item.quantity * item.unitPriceEurCents, 0);
-  const vatCents = Math.round(subtotalCents * 0.23);
-  const totalCents = subtotalCents + vatCents;
+  const itemLines = quote.items.map(item =>
+    `  ${item.index}. *${item.productName}* — ${item.quantity} ks @ ${centsToEur(item.unitPriceEurCents)} = ${centsToEur(item.lineTotalCents)}`
+  );
 
   const lines = [
-    `✅ *Parsovaná ponuka — prosím skontroluj:*`,
+    header,
     ``,
-    `*Zákazník:* ${q.customerName}`,
-    q.customerAddress ? `*Adresa:* ${q.customerAddress}` : null,
-    q.salesPersonName ? `*Obchodník:* ${q.salesPersonName}` : null,
+    `*Zákazník:* ${quote.customer.name}`,
+    quote.customer.address ? `*Adresa:* ${quote.customer.address}` : null,
     `*Jazyk:* ${langLabel}`,
     ``,
     `*Položky:*`,
     ...itemLines,
     ``,
-    `*Medzisúčet:* ${centsToEur(subtotalCents)}`,
-    `*DPH 23%:* ${centsToEur(vatCents)}`,
-    `*Celkom:* ${centsToEur(totalCents)}`,
-    q.notes ? `\n*Poznámky:* ${q.notes}` : null,
+    `*Medzisúčet:* ${centsToEur(quote.subtotalCents)}`,
+    `*DPH 23%:* ${centsToEur(quote.vatCents)}`,
+    `*Celkom:* ${centsToEur(quote.totalCents)}`,
+    quote.notes ? `\n*Poznámky:* ${quote.notes}` : null,
     ``,
     `_Ak je všetko správne, odpovez "OK" a vygenerujem PDF. Inak oprav čo treba._`,
   ];
 
   return lines.filter(l => l !== null).join('\n');
+}
+
+// Edit commands contain action verbs in SK/CZ/EN — distinct from new quote descriptions.
+function isEditCommand(text) {
+  const pattern = /\b(change|update|set|add|remove|rename|delete|increase|decrease|modify|edit|adjust|replace|fix|zme[nň]|pridaj|odober|nastav|oprav|uprav|vyma[zž]|zv[yý][šs]|zn[ií][zž]|aktualizuj|zm[eě]n|p[rř]idej|odeber|uber|zl[aá]va|zľava)\b/i;
+  return pattern.test(text);
 }
 
 // ── DM handlers ───────────────────────────────────────────────────────────────
@@ -165,23 +147,13 @@ async function handleOk(event) {
   const { channel, user } = event;
   console.log('[handleOk] user:', user);
 
-  const quoteInput = quoteStore.get(user);
-  if (!quoteInput) {
+  const quote = await getQuote(user);
+  if (!quote) {
     await postMessage(channel, '⚠️ Nemám uloženú žiadnu ponuku. Najprv mi pošli detaily ponuky.');
     return;
   }
 
   await postMessage(channel, '⏳ Generujem PDF, moment...');
-
-  let quote;
-  try {
-    quote = buildQuote(quoteInput, user);
-    console.log('[handleOk] quote built:', quote.filename);
-  } catch (err) {
-    console.error('[handleOk] buildQuote failed:', err.message);
-    await postMessage(channel, `⚠️ Chyba pri zostavovaní ponuky: ${err.message}`);
-    return;
-  }
 
   let pdfBuffer;
   try {
@@ -205,6 +177,40 @@ async function handleOk(event) {
   }
 }
 
+async function handleEdit(event) {
+  const { channel, user, text } = event;
+  console.log('[handleEdit] user:', user, 'command:', text.slice(0, 80));
+
+  const currentQuote = await getQuote(user);
+  if (!currentQuote) {
+    await postMessage(channel, '⚠️ Nemám uloženú žiadnu ponuku. Najprv mi pošli detaily ponuky.');
+    return;
+  }
+
+  await postMessage(channel, '✏️ Upravujem ponuku...');
+
+  let updatedQuote;
+  try {
+    updatedQuote = await editQuote(currentQuote, text);
+  } catch (err) {
+    console.error('[handleEdit] editQuote failed:', err.message);
+    await postMessage(channel, `⚠️ Nepodarilo sa upraviť ponuku: ${err.message}`);
+    return;
+  }
+
+  // Bump version and regenerate filename — never let Claude control these
+  updatedQuote.version = (currentQuote.version ?? 1) + 1;
+  updatedQuote.filename = `${updatedQuote.quoteNumber}-${slugify(updatedQuote.customer.name)}-v${updatedQuote.version}.pdf`;
+
+  await setQuote(user, updatedQuote);
+
+  const summary = formatSummary(
+    updatedQuote,
+    `✏️ *Ponuka upravená (v${updatedQuote.version}) — skontroluj zmeny:*`
+  );
+  await postMessage(channel, summary);
+}
+
 async function handleDm(event) {
   const { channel, text, user } = event;
 
@@ -213,12 +219,21 @@ async function handleDm(event) {
     return;
   }
 
-  // "OK" confirmation → generate PDF from stored quote
-  if (/^ok[.!]?$/i.test(text.trim())) {
+  const trimmed = text.trim();
+
+  // "OK" → generate PDF from stored quote
+  if (/^ok[.!]?$/i.test(trimmed)) {
     await handleOk(event);
     return;
   }
 
+  // Edit command → update stored quote via Claude
+  if (isEditCommand(trimmed)) {
+    await handleEdit(event);
+    return;
+  }
+
+  // New quote — parse with Claude, build Quote, store in Redis
   let quoteInput;
   try {
     quoteInput = await extractQuote(text);
@@ -239,12 +254,11 @@ async function handleDm(event) {
     return;
   }
 
-  // Store parsed quote so "OK" can retrieve it
-  quoteStore.set(user, quoteInput);
-  console.log('[handleDm] stored quoteInput for user:', user);
+  const quote = buildQuote(quoteInput, user);
+  await setQuote(user, quote);
+  console.log('[handleDm] stored quote for user:', user, 'filename:', quote.filename);
 
-  const summary = formatSummary(quoteInput);
-  await postMessage(channel, summary);
+  await postMessage(channel, formatSummary(quote));
 }
 
 // ── Vercel handler ────────────────────────────────────────────────────────────
@@ -287,9 +301,8 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // In-memory dedup: ignore the same event_id within 60 s
-    if (isDuplicate(payload.event_id)) {
-      console.log('[handler] duplicate event_id ignored:', payload.event_id);
+    // Redis dedup: atomic SET NX — ignore events seen in the last 60 s
+    if (await isDuplicateEvent(payload.event_id)) {
       return res.status(200).json({ ok: true });
     }
 

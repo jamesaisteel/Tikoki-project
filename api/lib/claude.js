@@ -63,3 +63,50 @@ export async function extractQuote(text) {
   console.log('[claude.extractQuote] parsed ok, items:', parsed.items?.length ?? 0);
   return parsed;
 }
+
+const EDIT_SYSTEM_PROMPT = `You are a quote editing assistant for Tikoki s.r.o., a custom sneaker manufacturer.
+
+You receive a Quote JSON object and an edit command from a salesperson. Apply the edit and return the updated Quote JSON — no prose, no markdown fences, nothing else.
+
+Recalculation rules (always apply after any price or quantity change):
+- lineTotalCents = quantity × unitPriceEurCents  (for each item)
+- subtotalCents  = sum of all lineTotalCents
+- vatCents       = Math.round(subtotalCents × 0.23)
+- totalCents     = subtotalCents + vatCents
+
+Rules:
+- Preserve all fields not mentioned in the edit command (quoteNumber, version, createdAt, validUntil, slackUserId, salesPerson, language, filename, etc.)
+- If a new item is added, assign the next sequential index value
+- Prices in edit commands follow the same format rules as extraction (€120 → 12000 cents)
+- Return ONLY the updated JSON object, nothing else`;
+
+export async function editQuote(currentQuote, command) {
+  console.log('[claude.editQuote] command:', command.slice(0, 100));
+
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 2048,
+    temperature: 0,
+    system: [
+      {
+        type: 'text',
+        text: EDIT_SYSTEM_PROMPT,
+        cache_control: { type: 'ephemeral' },
+      },
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: `Quote:\n${JSON.stringify(currentQuote, null, 2)}\n\nEdit command: ${command}`,
+      },
+    ],
+  });
+
+  const raw = response.content[0].text.trim();
+  console.log('[claude.editQuote] raw response:', raw.slice(0, 200));
+
+  const json = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+  const updated = JSON.parse(json);
+  console.log('[claude.editQuote] updated ok, items:', updated.items?.length ?? 0);
+  return updated;
+}
