@@ -35,7 +35,7 @@ export async function extractQuote(text) {
   console.log('[claude.extractQuote] input length:', text.length);
 
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-5',
     max_tokens: 1024,
     temperature: 0,
     system: [
