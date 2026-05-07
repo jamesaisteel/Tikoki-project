@@ -3,6 +3,7 @@ import { extractQuote, editQuote } from './lib/claude.js';
 import { buildQuote, centsToEur, slugify } from './lib/quote.js';
 import { generatePdf } from './lib/pdf.js';
 import { getQuote, setQuote, isDuplicateEvent } from './lib/redis.js';
+import { parseExcelFile } from './lib/excel.js';
 
 // Disable Vercel's automatic body parsing so we can read the raw body
 // needed for Slack signature verification
@@ -215,11 +216,43 @@ async function handleEdit(event) {
   await postMessage(channel, summary);
 }
 
+async function handleExcel(event, xlsxFile) {
+  const { channel, user } = event;
+  console.log('[handleExcel] user:', user, 'file:', xlsxFile.name);
+
+  await postMessage(channel, `📊 Spracovávam súbor *${xlsxFile.name}*...`);
+
+  let quoteInput;
+  try {
+    quoteInput = await parseExcelFile(xlsxFile);
+  } catch (err) {
+    console.error('[handleExcel] parseExcelFile failed:', err.message);
+    await postMessage(channel, `⚠️ Nepodarilo sa načítať Excel súbor:\n${err.message}`);
+    return;
+  }
+
+  const quote = buildQuote(quoteInput, user);
+  await setQuote(user, quote);
+  console.log('[handleExcel] stored quote for user:', user, 'filename:', quote.filename);
+
+  await postMessage(channel, formatSummary(quote));
+}
+
 async function handleDm(event) {
-  const { channel, text, user } = event;
+  const { channel, text, user, files } = event;
+
+  // Excel upload takes priority over any text in the message
+  const xlsxFile = files?.find(f =>
+    f.name?.toLowerCase().endsWith('.xlsx') ||
+    f.mimetype?.includes('spreadsheetml')
+  );
+  if (xlsxFile) {
+    await handleExcel(event, xlsxFile);
+    return;
+  }
 
   if (!text || !text.trim()) {
-    await postMessage(channel, '⚠️ Správa je prázdna. Pošli mi detaily ponuky a ja ich spracujem.');
+    await postMessage(channel, '⚠️ Správa je prázdna. Pošli mi detaily ponuky alebo nahraj Excel súbor.');
     return;
   }
 
@@ -317,13 +350,15 @@ export default async function handler(req, res) {
     const event = payload.event;
     console.log('[handler] event type:', event.type, '| subtype:', event.subtype ?? 'none', '| channel_type:', event.channel_type, '| bot_id:', event.bot_id ?? 'none');
 
-    // Only handle direct messages sent by humans (not bot echoes)
-    if (
+    // Only handle direct messages sent by humans (not bot echoes).
+    // Allow subtype "file_share" — Slack sets this when a file is attached.
+    const isHumanDm =
       event.type === 'message' &&
       !event.bot_id &&
-      !event.subtype &&
-      event.channel_type === 'im'
-    ) {
+      (!event.subtype || event.subtype === 'file_share') &&
+      event.channel_type === 'im';
+
+    if (isHumanDm) {
       console.log('[handler] processing DM in channel:', event.channel);
       await handleDm(event);
     } else {
