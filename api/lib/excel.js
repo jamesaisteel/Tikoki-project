@@ -3,13 +3,44 @@ import * as XLSX from 'xlsx';
 // ── Download ──────────────────────────────────────────────────────────────────
 
 export async function downloadSlackFile(urlPrivate) {
-  console.log('[excel.download] fetching file from Slack');
+  console.log('[excel.download] fetching', urlPrivate.slice(0, 60));
+
   const res = await fetch(urlPrivate, {
     headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    // Do not follow redirects — a redirect usually means auth failed and we'd
+    // silently receive an HTML login page instead of the binary file.
+    redirect: 'follow',
   });
-  if (!res.ok) throw new Error(`Slack file download failed: HTTP ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
+
+  const contentType = res.headers.get('content-type') ?? '';
+  console.log('[excel.download] status:', res.status, '| content-type:', contentType);
+
+  if (!res.ok) {
+    const snippet = await res.text();
+    console.error('[excel.download] error body:', snippet.slice(0, 300));
+    throw new Error(`Slack vrátil HTTP ${res.status} pri sťahovaní súboru.`);
+  }
+
+  if (contentType.includes('text/html')) {
+    const snippet = await res.text();
+    console.error('[excel.download] got HTML instead of binary — auth issue? Snippet:', snippet.slice(0, 300));
+    throw new Error(
+      'Bot nemá oprávnenie stiahnuť súbor. Skontroluj, či má bot scope "files:read" v Slack App nastaveniach.'
+    );
+  }
+
+  const arrayBuf = await res.arrayBuffer();
+  const buf = Buffer.from(arrayBuf);
   console.log('[excel.download] downloaded', buf.length, 'bytes');
+
+  // xlsx files are ZIP archives — magic bytes must be PK (0x50 0x4B)
+  if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4B) {
+    console.error('[excel.download] bad magic bytes:', buf.slice(0, 4).toString('hex'));
+    throw new Error(
+      'Stiahnutý súbor nie je platný .xlsx súbor. Uisti sa, že ukladáš v novom Excel formáte (nie .xls alebo .csv).'
+    );
+  }
+
   return buf;
 }
 
@@ -156,7 +187,8 @@ function extractNotes(kvMap) {
 
 export async function parseExcelFile(slackFile) {
   const buffer = await downloadSlackFile(slackFile.url_private_download);
-  const wb = XLSX.read(buffer, { type: 'buffer' });
+  // Pass as Uint8Array with type:'array' — more reliable than type:'buffer' across xlsx versions
+  const wb = XLSX.read(new Uint8Array(buffer), { type: 'array' });
 
   console.log('[excel.parse] sheets found:', wb.SheetNames.join(', '));
 
