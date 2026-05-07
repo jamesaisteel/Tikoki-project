@@ -99,7 +99,7 @@ async function uploadPdf(channel, pdfBuffer, filename, message) {
     putRes = await fetch(upload_url, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/octet-stream' },
-      body: pdfBuffer,
+      body: Buffer.from(pdfBuffer),
     });
   } catch (err) {
     logFetchError('step 2 PUT pre-signed URL', err);
