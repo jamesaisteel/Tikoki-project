@@ -63,9 +63,9 @@ async function postMessage(channel, text) {
   }
 }
 
-// PUT a buffer to a URL using the native https module, which handles redirects
-// correctly without detaching the ArrayBuffer (unlike Node.js fetch).
-function httpsPut(targetUrl, buffer) {
+// PUT a buffer to a URL using the native https module, manually following
+// redirects so the buffer is never detached (unlike Node.js fetch).
+function httpsPutOnce(targetUrl, buffer) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
     const req = https.request({
@@ -78,12 +78,27 @@ function httpsPut(targetUrl, buffer) {
       },
     }, (res) => {
       res.resume();
-      resolve(res.statusCode);
+      resolve({ statusCode: res.statusCode, location: res.headers.location });
     });
     req.on('error', reject);
     req.write(buffer);
     req.end();
   });
+}
+
+async function httpsPut(targetUrl, buffer, maxRedirects = 3) {
+  let url = targetUrl;
+  for (let i = 0; i <= maxRedirects; i++) {
+    const { statusCode, location } = await httpsPutOnce(url, buffer);
+    console.log('[httpsPut] status:', statusCode, 'location:', location ?? '(none)');
+    if (statusCode === 200 || statusCode === 204) return statusCode;
+    if ([301, 302, 303, 307].includes(statusCode) && location) {
+      url = location;
+      continue;
+    }
+    throw new Error(`PUT failed: HTTP ${statusCode}`);
+  }
+  throw new Error(`PUT failed: too many redirects (>${maxRedirects})`);
 }
 
 // Uploads a PDF buffer to a Slack channel using the Files v2 API.
