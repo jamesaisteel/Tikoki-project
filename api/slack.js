@@ -62,31 +62,54 @@ async function postMessage(channel, text) {
   }
 }
 
+function logFetchError(step, err) {
+  console.error(`[uploadPdf] ${step} fetch failed:`, err?.message);
+  console.error(`[uploadPdf] ${step} error.cause:`, err?.cause);
+  console.error(`[uploadPdf] ${step} full error:`, err);
+}
+
 // Uploads a PDF buffer to a Slack channel using the Files v2 API.
 async function uploadPdf(channel, pdfBuffer, filename, message) {
   const token = process.env.SLACK_BOT_TOKEN;
 
   // Step 1 — request an upload URL
-  console.log('[uploadPdf] requesting upload URL for', filename, pdfBuffer.length, 'bytes');
-  const urlRes = await fetch('https://slack.com/api/files.getUploadURLExternal', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: new URLSearchParams({ filename, length: String(pdfBuffer.length) }),
-  });
+  console.log('[uploadPdf] step 1: getUploadURLExternal for', filename, pdfBuffer.length, 'bytes');
+  let urlRes;
+  try {
+    urlRes = await fetch('https://slack.com/api/files.getUploadURLExternal', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ filename, length: String(pdfBuffer.length) }),
+    });
+  } catch (err) {
+    logFetchError('step 1 getUploadURLExternal', err);
+    throw err;
+  }
   const { ok: urlOk, upload_url, file_id, error: urlErr } = await urlRes.json();
+  console.log('[uploadPdf] step 1 response: ok=', urlOk, 'file_id=', file_id, 'error=', urlErr);
   if (!urlOk) throw new Error(`getUploadURLExternal: ${urlErr}`);
 
   // Step 2 — PUT the file bytes to the pre-signed URL (Slack requires PUT, not POST)
-  console.log('[uploadPdf] uploading bytes to pre-signed URL, file_id:', file_id);
-  const putRes = await fetch(upload_url, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: pdfBuffer,
-  });
-  console.log('[uploadPdf] PUT status:', putRes.status);
+  console.log('[uploadPdf] step 2: PUT', pdfBuffer.length, 'bytes to pre-signed URL');
+  let putRes;
+  try {
+    putRes = await fetch(upload_url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: pdfBuffer,
+    });
+  } catch (err) {
+    logFetchError('step 2 PUT pre-signed URL', err);
+    throw err;
+  }
+  console.log('[uploadPdf] step 2 PUT status:', putRes.status, putRes.statusText);
+  if (!putRes.ok) {
+    const body = await putRes.text().catch(() => '');
+    throw new Error(`PUT pre-signed URL failed: HTTP ${putRes.status} — ${body.slice(0, 200)}`);
+  }
 
   // Step 3 — complete the upload and share into the channel.
   // Only include initial_comment if non-null — Slack rejects null field values
@@ -96,22 +119,28 @@ async function uploadPdf(channel, pdfBuffer, filename, message) {
     channel_id: channel,
     ...(message != null ? { initial_comment: message } : {}),
   };
-  console.log('[uploadPdf] completeUploadExternal payload:', JSON.stringify(completePayload));
+  console.log('[uploadPdf] step 3: completeUploadExternal payload:', JSON.stringify(completePayload));
 
-  const completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(completePayload),
-  });
+  let completeRes;
+  try {
+    completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(completePayload),
+    });
+  } catch (err) {
+    logFetchError('step 3 completeUploadExternal', err);
+    throw err;
+  }
   const completeData = await completeRes.json();
-  console.log('[uploadPdf] completeUploadExternal response:', JSON.stringify(completeData).slice(0, 300));
+  console.log('[uploadPdf] step 3 response:', JSON.stringify(completeData).slice(0, 300));
   if (!completeData.ok) throw new Error(`completeUploadExternal: ${completeData.error}`);
 
   const permalink = completeData.files?.[0]?.permalink ?? null;
-  console.log('[uploadPdf] upload complete, permalink:', permalink);
+  console.log('[uploadPdf] done, permalink:', permalink);
   return permalink;
 }
 
