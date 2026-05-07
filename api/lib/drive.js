@@ -63,6 +63,11 @@ export async function uploadPdfToDrive(pdfBuffer, filename) {
   let file;
   try {
     const res = await drive.files.create({
+      // supportsAllDrives: file is created inside the parent folder owned by the
+      // user's Google account; without this flag Drive tries to bill the service
+      // account's own storage quota, which is zero and causes "does not have
+      // storage quota" errors.
+      supportsAllDrives: true,
       requestBody: {
         name: filename,
         parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
@@ -83,6 +88,7 @@ export async function uploadPdfToDrive(pdfBuffer, filename) {
   try {
     await drive.permissions.create({
       fileId: file.id,
+      supportsAllDrives: true,
       requestBody: { role: 'reader', type: 'anyone' },
     });
   } catch (err) {
@@ -109,6 +115,8 @@ export async function listImages() {
   const folderId = getImagesFolderId();
 
   const { data } = await drive.files.list({
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
     q: `'${folderId}' in parents and mimeType contains 'image/' and trashed=false`,
     fields: 'files(id,name,mimeType)',
     orderBy: 'name',
@@ -126,6 +134,8 @@ export async function fetchImageAsBase64(filename) {
   // Escape single-quotes in filename for the query
   const safeName = filename.replace(/'/g, "\\'");
   const { data } = await drive.files.list({
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
     q: `'${folderId}' in parents and name='${safeName}' and trashed=false`,
     fields: 'files(id,name,mimeType)',
   });
@@ -139,7 +149,7 @@ export async function fetchImageAsBase64(filename) {
   console.log('[drive.fetchImage] downloading:', fileInfo.name, fileInfo.id);
 
   const response = await drive.files.get(
-    { fileId: fileInfo.id, alt: 'media' },
+    { fileId: fileInfo.id, alt: 'media', supportsAllDrives: true },
     { responseType: 'arraybuffer' }
   );
 
