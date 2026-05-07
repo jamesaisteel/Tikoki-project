@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import { extractQuote } from './lib/claude.js';
+import { buildQuote, centsToEur } from './lib/quote.js';
+import { generatePdf } from './lib/pdf.js';
 
 // Disable Vercel's automatic body parsing so we can read the raw body
 // needed for Slack signature verification
@@ -8,6 +10,12 @@ export const config = {
     bodyParser: false,
   },
 };
+
+// In-memory quote store keyed by Slack user ID.
+// Replaced by Redis in Stage 4 — warm Vercel instances retain this between requests.
+const quoteStore = new Map();
+
+// ── Slack helpers ─────────────────────────────────────────────────────────────
 
 async function getRawBody(req) {
   const chunks = [];
@@ -55,9 +63,51 @@ async function postMessage(channel, text) {
   }
 }
 
-function centsToEur(cents) {
-  return `€${(cents / 100).toFixed(2)}`;
+// Uploads a PDF buffer to a Slack channel using the Files v2 API.
+async function uploadPdf(channel, pdfBuffer, filename, message) {
+  const token = process.env.SLACK_BOT_TOKEN;
+
+  // Step 1 — request an upload URL
+  console.log('[uploadPdf] requesting upload URL for', filename, pdfBuffer.length, 'bytes');
+  const urlRes = await fetch('https://slack.com/api/files.getUploadURLExternal', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({ filename, length: String(pdfBuffer.length) }),
+  });
+  const { ok: urlOk, upload_url, file_id, error: urlErr } = await urlRes.json();
+  if (!urlOk) throw new Error(`getUploadURLExternal: ${urlErr}`);
+
+  // Step 2 — PUT the file bytes to the pre-signed URL
+  console.log('[uploadPdf] uploading to pre-signed URL, file_id:', file_id);
+  await fetch(upload_url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: pdfBuffer,
+  });
+
+  // Step 3 — complete the upload and share into the channel
+  console.log('[uploadPdf] completing upload');
+  const completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      files: [{ id: file_id, title: filename }],
+      channel_id: channel,
+      initial_comment: message,
+    }),
+  });
+  const completeData = await completeRes.json();
+  if (!completeData.ok) throw new Error(`completeUploadExternal: ${completeData.error}`);
+  console.log('[uploadPdf] upload complete');
 }
+
+// ── Formatting helpers ────────────────────────────────────────────────────────
 
 function formatSummary(q) {
   const langLabel = { sk: '🇸🇰 SK', cz: '🇨🇿 CZ', en: '🇬🇧 EN' }[q.language] ?? q.language;
@@ -93,11 +143,63 @@ function formatSummary(q) {
   return lines.filter(l => l !== null).join('\n');
 }
 
+// ── DM handlers ───────────────────────────────────────────────────────────────
+
+async function handleOk(event) {
+  const { channel, user } = event;
+  console.log('[handleOk] user:', user);
+
+  const quoteInput = quoteStore.get(user);
+  if (!quoteInput) {
+    await postMessage(channel, '⚠️ Nemám uloženú žiadnu ponuku. Najprv mi pošli detaily ponuky.');
+    return;
+  }
+
+  await postMessage(channel, '⏳ Generujem PDF, moment...');
+
+  let quote;
+  try {
+    quote = buildQuote(quoteInput, user);
+    console.log('[handleOk] quote built:', quote.filename);
+  } catch (err) {
+    console.error('[handleOk] buildQuote failed:', err.message);
+    await postMessage(channel, `⚠️ Chyba pri zostavovaní ponuky: ${err.message}`);
+    return;
+  }
+
+  let pdfBuffer;
+  try {
+    pdfBuffer = await generatePdf(quote);
+  } catch (err) {
+    console.error('[handleOk] generatePdf failed:', err.message);
+    await postMessage(channel, `⚠️ Chyba pri generovaní PDF: ${err.message}`);
+    return;
+  }
+
+  try {
+    await uploadPdf(
+      channel,
+      pdfBuffer,
+      quote.filename,
+      `📄 Ponuka *${quote.quoteNumber}* pre *${quote.customer.name}* je pripravená! | Celkom: ${centsToEur(quote.totalCents)} vr. DPH`
+    );
+  } catch (err) {
+    console.error('[handleOk] uploadPdf failed:', err.message);
+    await postMessage(channel, `⚠️ PDF vygenerované, ale nepodarilo sa odoslať: ${err.message}`);
+  }
+}
+
 async function handleDm(event) {
-  const { channel, text } = event;
+  const { channel, text, user } = event;
 
   if (!text || !text.trim()) {
     await postMessage(channel, '⚠️ Správa je prázdna. Pošli mi detaily ponuky a ja ich spracujem.');
+    return;
+  }
+
+  // "OK" confirmation → generate PDF from stored quote
+  if (/^ok[.!]?$/i.test(text.trim())) {
+    await handleOk(event);
     return;
   }
 
@@ -121,9 +223,15 @@ async function handleDm(event) {
     return;
   }
 
+  // Store parsed quote so "OK" can retrieve it
+  quoteStore.set(user, quoteInput);
+  console.log('[handleDm] stored quoteInput for user:', user);
+
   const summary = formatSummary(quoteInput);
   await postMessage(channel, summary);
 }
+
+// ── Vercel handler ────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
   console.log('[handler] incoming', req.method, req.url);
