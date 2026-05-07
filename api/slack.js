@@ -136,9 +136,13 @@ function formatSummary(quote, header = '✅ *Parsovaná ponuka — prosím skont
 }
 
 // Edit commands contain action verbs in SK/CZ/EN — distinct from new quote descriptions.
+// Uses Unicode lookarounds (u flag) because \b only treats ASCII [a-zA-Z0-9_] as word chars;
+// Slovak letters like ň, č, ž are non-\w so \bzmeň\b never fires.
 function isEditCommand(text) {
-  const pattern = /\b(change|update|set|add|remove|rename|delete|increase|decrease|modify|edit|adjust|replace|fix|zme[nň]|pridaj|odober|nastav|oprav|uprav|vyma[zž]|zv[yý][šs]|zn[ií][zž]|aktualizuj|zm[eě]n|p[rř]idej|odeber|uber|zl[aá]va|zľava)\b/i;
-  return pattern.test(text);
+  const pattern = /(?<!\p{L})(change|update|set|add|remove|rename|delete|increase|decrease|modify|edit|adjust|replace|fix|zme[nň]|pridaj|odober|nastav|oprav|uprav|vyma[zž]|zv[yý][šs]|zn[ií][zž]|aktualizuj|zm[eě]n|p[rř]idej|odeber|uber|zl[aá]va|zľava)(?!\p{L})/iu;
+  const result = pattern.test(text);
+  console.log('[isEditCommand] text:', text.slice(0, 60), '| result:', result);
+  return result;
 }
 
 // ── DM handlers ───────────────────────────────────────────────────────────────
@@ -220,6 +224,7 @@ async function handleDm(event) {
   }
 
   const trimmed = text.trim();
+  console.log('[handleDm] user:', user, '| text:', trimmed.slice(0, 80));
 
   // "OK" → generate PDF from stored quote
   if (/^ok[.!]?$/i.test(trimmed)) {
@@ -232,6 +237,9 @@ async function handleDm(event) {
     await handleEdit(event);
     return;
   }
+
+  // Log that we're treating this as a new quote (not an edit)
+  console.log('[handleDm] treating as new quote, will overwrite any stored quote for user:', user);
 
   // New quote — parse with Claude, build Quote, store in Redis
   let quoteInput;
