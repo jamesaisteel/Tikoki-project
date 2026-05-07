@@ -79,29 +79,35 @@ async function uploadPdf(channel, pdfBuffer, filename, message) {
   const { ok: urlOk, upload_url, file_id, error: urlErr } = await urlRes.json();
   if (!urlOk) throw new Error(`getUploadURLExternal: ${urlErr}`);
 
-  // Step 2 — PUT the file bytes to the pre-signed URL
-  console.log('[uploadPdf] uploading to pre-signed URL, file_id:', file_id);
-  await fetch(upload_url, {
-    method: 'POST',
+  // Step 2 — PUT the file bytes to the pre-signed URL (Slack requires PUT, not POST)
+  console.log('[uploadPdf] uploading bytes to pre-signed URL, file_id:', file_id);
+  const putRes = await fetch(upload_url, {
+    method: 'PUT',
     headers: { 'Content-Type': 'application/octet-stream' },
     body: pdfBuffer,
   });
+  console.log('[uploadPdf] PUT status:', putRes.status);
 
-  // Step 3 — complete the upload and share into the channel
-  console.log('[uploadPdf] completing upload');
+  // Step 3 — complete the upload and share into the channel.
+  // Only include initial_comment if non-null — Slack rejects null field values
+  // with invalid_arguments.
+  const completePayload = {
+    files: [{ id: file_id, title: filename }],
+    channel_id: channel,
+    ...(message != null ? { initial_comment: message } : {}),
+  };
+  console.log('[uploadPdf] completeUploadExternal payload:', JSON.stringify(completePayload));
+
   const completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      files: [{ id: file_id, title: filename }],
-      channel_id: channel,
-      initial_comment: message,
-    }),
+    body: JSON.stringify(completePayload),
   });
   const completeData = await completeRes.json();
+  console.log('[uploadPdf] completeUploadExternal response:', JSON.stringify(completeData).slice(0, 300));
   if (!completeData.ok) throw new Error(`completeUploadExternal: ${completeData.error}`);
 
   const permalink = completeData.files?.[0]?.permalink ?? null;
