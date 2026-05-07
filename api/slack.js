@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { extractQuote } from './lib/claude.js';
 
 // Disable Vercel's automatic body parsing so we can read the raw body
 // needed for Slack signature verification
@@ -54,6 +55,76 @@ async function postMessage(channel, text) {
   }
 }
 
+function centsToEur(cents) {
+  return `€${(cents / 100).toFixed(2)}`;
+}
+
+function formatSummary(q) {
+  const langLabel = { sk: '🇸🇰 SK', cz: '🇨🇿 CZ', en: '🇬🇧 EN' }[q.language] ?? q.language;
+
+  const itemLines = q.items.map((item, i) => {
+    const lineTotal = item.quantity * item.unitPriceEurCents;
+    return `  ${i + 1}. *${item.productName}* — ${item.quantity} ks @ ${centsToEur(item.unitPriceEurCents)} = ${centsToEur(lineTotal)}`;
+  });
+
+  const subtotalCents = q.items.reduce((sum, item) => sum + item.quantity * item.unitPriceEurCents, 0);
+  const vatCents = Math.round(subtotalCents * 0.23);
+  const totalCents = subtotalCents + vatCents;
+
+  const lines = [
+    `✅ *Parsovaná ponuka — prosím skontroluj:*`,
+    ``,
+    `*Zákazník:* ${q.customerName}`,
+    q.customerAddress ? `*Adresa:* ${q.customerAddress}` : null,
+    q.salesPersonName ? `*Obchodník:* ${q.salesPersonName}` : null,
+    `*Jazyk:* ${langLabel}`,
+    ``,
+    `*Položky:*`,
+    ...itemLines,
+    ``,
+    `*Medzisúčet:* ${centsToEur(subtotalCents)}`,
+    `*DPH 23%:* ${centsToEur(vatCents)}`,
+    `*Celkom:* ${centsToEur(totalCents)}`,
+    q.notes ? `\n*Poznámky:* ${q.notes}` : null,
+    ``,
+    `_Ak je všetko správne, odpovez "OK" a vygenerujem PDF. Inak oprav čo treba._`,
+  ];
+
+  return lines.filter(l => l !== null).join('\n');
+}
+
+async function handleDm(event) {
+  const { channel, text } = event;
+
+  if (!text || !text.trim()) {
+    await postMessage(channel, '⚠️ Správa je prázdna. Pošli mi detaily ponuky a ja ich spracujem.');
+    return;
+  }
+
+  let quoteInput;
+  try {
+    quoteInput = await extractQuote(text);
+  } catch (err) {
+    console.error('[handleDm] Claude extraction failed:', err.message);
+    await postMessage(
+      channel,
+      `⚠️ Nepodarilo sa spracovať vstup: ${err.message}\nSkúste znova alebo kontaktujte správcu.`
+    );
+    return;
+  }
+
+  if (!quoteInput.items || quoteInput.items.length === 0) {
+    await postMessage(
+      channel,
+      '⚠️ Nenašiel som žiadne položky v tvojej správe. Pošli mi zoznam produktov s množstvami a cenami.'
+    );
+    return;
+  }
+
+  const summary = formatSummary(quoteInput);
+  await postMessage(channel, summary);
+}
+
 export default async function handler(req, res) {
   console.log('[handler] incoming', req.method, req.url);
 
@@ -96,10 +167,8 @@ export default async function handler(req, res) {
       !event.subtype &&
       event.channel_type === 'im'
     ) {
-      console.log('[handler] replying to DM in channel:', event.channel);
-      // postMessage runs BEFORE ack — Vercel terminates the function once res is sent,
-      // so any await after res.json() would never execute.
-      await postMessage(event.channel, 'Tikoki Agent is online! 🟢');
+      console.log('[handler] processing DM in channel:', event.channel);
+      await handleDm(event);
     } else {
       console.log('[handler] event skipped (not a human DM)');
     }
