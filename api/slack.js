@@ -2,9 +2,10 @@ import crypto from 'crypto';
 import { extractQuote, editQuote } from './lib/claude.js';
 import { buildQuote, centsToEur, slugify } from './lib/quote.js';
 import { generatePdf } from './lib/pdf.js';
-import { getQuote, setQuote, isDuplicateEvent, nextQuoteNumber } from './lib/redis.js';
+import { getQuote, setQuote, isDuplicateEvent, nextQuoteNumber, storePdfBuffer, getPdfBuffer, deletePdfBuffer } from './lib/redis.js';
 import { parseExcelFile } from './lib/excel.js';
 import { listImages, fetchImageAsBase64 } from './lib/drive.js';
+import { uploadPdfToDropbox } from './lib/dropbox.js';
 
 // Disable Vercel's automatic body parsing so we can read the raw body
 // needed for Slack signature verification
@@ -234,6 +235,45 @@ async function handleOk(event) {
       await postMessage(channel, `⚠️ Obrázky nenájdené: *${missingImages.join(', ')}*`);
     }
   }
+
+  // Store buffer in Redis for 5 min and ask what to do next
+  await storePdfBuffer(user, pdfBuffer);
+  await postMessage(
+    channel,
+    `📋 Ponuka odoslaná! Čo chceš urobiť?\n*UPLOAD* — nahrať na Dropbox\n*TERMINATE* — zahodiť ponuku`
+  );
+}
+
+async function handleUpload(event) {
+  const { channel, user } = event;
+  console.log('[handleUpload] user:', user);
+
+  const quote = await getQuote(user);
+  const pdfBuffer = await getPdfBuffer(user);
+  if (!pdfBuffer || !quote) {
+    await postMessage(channel, '⚠️ PDF nie je dostupné (platnosť 5 minút vypršala). Vygeneruj ponuku znova pomocou *OK*.');
+    return;
+  }
+
+  await postMessage(channel, '⏳ Nahrávam na Dropbox...');
+  let url;
+  try {
+    url = await uploadPdfToDropbox(pdfBuffer, quote.filename);
+  } catch (err) {
+    console.error('[handleUpload] Dropbox upload failed:', err.message);
+    await postMessage(channel, `⚠️ Nahrávanie na Dropbox zlyhalo: ${err.message}`);
+    return;
+  }
+
+  await deletePdfBuffer(user);
+  await postMessage(channel, `✅ Nahraté! Link: ${url}`);
+}
+
+async function handleTerminate(event) {
+  const { channel, user } = event;
+  console.log('[handleTerminate] user:', user);
+  await deletePdfBuffer(user);
+  await postMessage(channel, '🗑️ Ponuka zrušená.');
 }
 
 async function handleEdit(event) {
@@ -317,6 +357,18 @@ async function handleDm(event) {
   // "OK" → generate PDF from stored quote
   if (/^ok[.!]?$/i.test(trimmed)) {
     await handleOk(event);
+    return;
+  }
+
+  // "UPLOAD" → upload buffered PDF to Dropbox
+  if (/^upload[.!]?$/i.test(trimmed)) {
+    await handleUpload(event);
+    return;
+  }
+
+  // "TERMINATE" → discard buffered PDF
+  if (/^terminate[.!]?$/i.test(trimmed)) {
+    await handleTerminate(event);
     return;
   }
 
