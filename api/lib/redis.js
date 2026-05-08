@@ -27,3 +27,10 @@ export async function isDuplicateEvent(eventId) {
   if (duplicate) console.log('[redis.isDuplicateEvent] duplicate:', eventId);
   return duplicate;
 }
+
+// Atomically increments the global quote counter and returns a 4-digit zero-padded string.
+export async function nextQuoteNumber() {
+  const n = await redis.incr('tikoki:ponuka:counter');
+  console.log('[redis.nextQuoteNumber] counter:', n);
+  return String(n).padStart(4, '0');
+}

@@ -1,6 +1,6 @@
 export const VAT_RATE = 0.23;
 
-export function buildQuote(quoteInput, slackUserId) {
+export function buildQuote(quoteInput, slackUserId, quoteNumber) {
   const now = new Date();
   const validUntil = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
@@ -18,8 +18,6 @@ export function buildQuote(quoteInput, slackUserId) {
   const vatCents = Math.round(subtotalCents * VAT_RATE);
   const totalCents = subtotalCents + vatCents;
 
-  // Stage 3: hardcoded quote number — replaced by Redis INCR in Stage 4
-  const quoteNumber = '0001';
   const slug = slugify(quoteInput.customerName);
 
   return {

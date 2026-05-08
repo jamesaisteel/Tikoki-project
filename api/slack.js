@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { extractQuote, editQuote } from './lib/claude.js';
 import { buildQuote, centsToEur, slugify } from './lib/quote.js';
 import { generatePdf } from './lib/pdf.js';
-import { getQuote, setQuote, isDuplicateEvent } from './lib/redis.js';
+import { getQuote, setQuote, isDuplicateEvent, nextQuoteNumber } from './lib/redis.js';
 import { parseExcelFile } from './lib/excel.js';
 import { listImages, fetchImageAsBase64 } from './lib/drive.js';
 
@@ -59,6 +59,20 @@ async function postMessage(channel, text) {
     console.log('[postMessage] sent ok, ts:', data.ts);
   } else {
     console.error('[postMessage] error:', data.error);
+  }
+}
+
+// Retries an async function up to `retries` times with exponential-ish back-off.
+async function withRetry(fn, retries = 3, delayMs = 500) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      console.error(`[withRetry] attempt ${attempt}/${retries} failed:`, err.message, `— retrying in ${delayMs}ms`);
+      await new Promise(r => setTimeout(r, delayMs));
+      delayMs *= 2;
+    }
   }
 }
 
@@ -187,10 +201,10 @@ async function handleOk(event) {
 
   let pdfBuffer;
   try {
-    pdfBuffer = await generatePdf(quoteCopy);
+    pdfBuffer = await withRetry(() => generatePdf(quoteCopy), 3, 500);
   } catch (err) {
-    console.error('[handleOk] generatePdf failed:', err.message);
-    await postMessage(channel, `⚠️ Chyba pri generovaní PDF: ${err.message}`);
+    console.error('[handleOk] generatePdf failed after 3 attempts:', err.message);
+    await postMessage(channel, '⚠️ PDF sa nepodarilo vygenerovať ani po 3 pokusoch. Skúste znova neskôr alebo kontaktujte správcu.');
     return;
   }
 
@@ -239,7 +253,7 @@ async function handleEdit(event) {
     updatedQuote = await editQuote(currentQuote, text);
   } catch (err) {
     console.error('[handleEdit] editQuote failed:', err.message);
-    await postMessage(channel, `⚠️ Nepodarilo sa upraviť ponuku: ${err.message}`);
+    await postMessage(channel, '⚠️ AI asistent momentálne nie je dostupný. Skúste úpravu znova o chvíľu.');
     return;
   }
 
@@ -271,7 +285,8 @@ async function handleExcel(event, xlsxFile) {
     return;
   }
 
-  const quote = buildQuote(quoteInput, user);
+  const quoteNumber = await nextQuoteNumber();
+  const quote = buildQuote(quoteInput, user, quoteNumber);
   await setQuote(user, quote);
   console.log('[handleExcel] stored quote for user:', user, 'filename:', quote.filename);
 
@@ -322,7 +337,7 @@ async function handleDm(event) {
     console.error('[handleDm] Claude extraction failed:', err.message);
     await postMessage(
       channel,
-      `⚠️ Nepodarilo sa spracovať vstup: ${err.message}\nSkúste znova alebo kontaktujte správcu.`
+      '⚠️ AI asistent momentálne nie je dostupný. Skúste správu odoslať znova o chvíľu.\nAk problém pretrváva, kontaktujte správcu.'
     );
     return;
   }
@@ -335,7 +350,8 @@ async function handleDm(event) {
     return;
   }
 
-  const quote = buildQuote(quoteInput, user);
+  const quoteNumber = await nextQuoteNumber();
+  const quote = buildQuote(quoteInput, user, quoteNumber);
   await setQuote(user, quote);
   console.log('[handleDm] stored quote for user:', user, 'filename:', quote.filename);
 
